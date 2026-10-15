@@ -1,0 +1,549 @@
+diff --git a/backend/.gitignore b/backend/.gitignore
+new file mode 100644
+index 0000000..82f0c3a
+--- /dev/null
++++ b/backend/.gitignore
+@@ -0,0 +1 @@
++/data/
+diff --git a/backend/documentStore.js b/backend/documentStore.js
+new file mode 100644
+index 0000000..f6ad30b
+--- /dev/null
++++ b/backend/documentStore.js
+@@ -0,0 +1,96 @@
++import { randomUUID } from "node:crypto";
++import {
++  mkdir,
++  readFile,
++  readdir,
++  rename,
++  rm,
++  writeFile,
++} from "node:fs/promises";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++
++const DATA_DIRECTORY = path.join(
++  path.dirname(fileURLToPath(import.meta.url)),
++  "data",
++  "documents",
++);
++const DOCUMENT_ID_PATTERN =
++  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++
++function getDocumentPath(id) {
++  if (!DOCUMENT_ID_PATTERN.test(id)) {
++    throw new TypeError("Invalid document ID.");
++  }
++
++  return path.join(DATA_DIRECTORY, `${id}.json`);
++}
++
++export async function listDocuments() {
++  let filenames;
++
++  try {
++    filenames = await readdir(DATA_DIRECTORY);
++  } catch (error) {
++    if (error.code === "ENOENT") return [];
++    throw error;
++  }
++
++  const documentFiles = filenames.filter((filename) =>
++    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i.test(
++      filename,
++    ),
++  );
++  const documents = await Promise.all(
++    documentFiles.map(async (filename) => {
++      const contents = await readFile(
++        path.join(DATA_DIRECTORY, filename),
++        "utf8",
++      );
++      return JSON.parse(contents);
++    }),
++  );
++
++  return documents.sort(
++    (first, second) =>
++      new Date(second.importedAt).getTime() -
++      new Date(first.importedAt).getTime(),
++  );
++}
++
++export async function getDocument(id) {
++  try {
++    const contents = await readFile(getDocumentPath(id), "utf8");
++    return JSON.parse(contents);
++  } catch (error) {
++    if (error.code === "ENOENT") return null;
++    throw error;
++  }
++}
++
++export async function saveDocument(document) {
++  const destination = getDocumentPath(document?.id);
++  await mkdir(DATA_DIRECTORY, { recursive: true });
++
++  const temporaryFile = path.join(
++    DATA_DIRECTORY,
++    `${document.id}.${randomUUID()}.tmp`,
++  );
++
++  try {
++    await writeFile(temporaryFile, JSON.stringify(document), {
++      encoding: "utf8",
++      flag: "wx",
++    });
++    await rename(temporaryFile, destination);
++  } catch (error) {
++    await rm(temporaryFile, { force: true }).catch(() => {});
++    throw error;
++  }
++
++  return document;
++}
++
++export async function deleteDocument(id) {
++  await rm(getDocumentPath(id), { force: true });
++}
+diff --git a/backend/server.js b/backend/server.js
+index 3c157ca..4fed248 100644
+--- a/backend/server.js
++++ b/backend/server.js
+@@ -1,12 +1,43 @@
+ 
+ import express from "express";
+ import multer from "multer";
++import { randomUUID } from "node:crypto";
+ import pdfParse from "pdf-parse/lib/pdf-parse.js";
+ import path from "node:path";
++import {
++  deleteDocument,
++  getDocument,
++  listDocuments,
++  saveDocument,
++} from "./documentStore.js";
+ 
+ const app = express();
+ const PORT = 3001;
+ const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
++const UUID_PATTERN =
++  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++const SUMMARY_FIELDS = [
++  "keyPoints",
++  "actionItems",
++  "datesAndDeadlines",
++  "keyFigures",
++  "contacts",
++];
++
++function isValidSummary(summary) {
++  return (
++    summary &&
++    typeof summary === "object" &&
++    SUMMARY_FIELDS.every(
++      (field) =>
++        Array.isArray(summary[field]) &&
++        summary[field].length <= 4 &&
++        summary[field].every(
++          (item) => typeof item === "string" && item.length <= 600,
++        ),
++    )
++  );
++}
+ 
+ app.use(express.json({ limit: "100kb" }));
+ 
+@@ -28,6 +59,46 @@ app.get("/api/health", (req, res) => {
+   });
+ });
+ 
++// Return the local library, including extracted text and saved highlights.
++app.get("/api/documents", async (_req, res) => {
++  return res.json(await listDocuments());
++});
++
++// Save refreshed highlights alongside the extracted document text.
++app.put("/api/documents/:id/summary", async (req, res) => {
++  const { id } = req.params;
++  const { summary } = req.body ?? {};
++
++  if (!UUID_PATTERN.test(id)) {
++    return res.status(400).json({ error: "Invalid document ID." });
++  }
++
++  if (!isValidSummary(summary)) {
++    return res.status(400).json({ error: "Invalid document highlights." });
++  }
++
++  const document = await getDocument(id);
++  if (!document) {
++    return res.status(404).json({ error: "Document not found." });
++  }
++
++  document.summary = summary;
++  await saveDocument(document);
++  return res.json({ success: true });
++});
++
++// Remove the document's saved text, metadata, and highlights from this device.
++app.delete("/api/documents/:id", async (req, res) => {
++  const { id } = req.params;
++
++  if (!UUID_PATTERN.test(id)) {
++    return res.status(400).json({ error: "Invalid document ID." });
++  }
++
++  await deleteDocument(id);
++  return res.status(204).end();
++});
++
+ // Extract text from PDF or TXT files.
+ app.post(
+   "/api/documents/extract",
+@@ -66,15 +137,31 @@ app.post(
+         extractedText = result.text;
+       }
+ 
+-      return res.json({
++      const document = {
++        id: randomUUID(),
+         filename: path.basename(req.file.originalname),
+         fileType: extension.slice(1).toUpperCase(),
++        fileSize: req.file.size,
++        importedAt: new Date().toISOString(),
+         characters: extractedText.length,
+         text: extractedText,
+         note: extractedText.trim()
+           ? null
+-          : "No readable text was found. Scanned PDFs may need OCR."
+-      });
++          : "No readable text was found. Scanned PDFs may need OCR.",
++        summary: null,
++      };
++
++      try {
++        await saveDocument(document);
++      } catch (saveError) {
++        console.error("Local document save failed:", saveError.message);
++        return res.status(500).json({
++          error:
++            "The file was read, but ClearDoc could not save it on this device. Check the local data folder permissions and try again.",
++        });
++      }
++
++      return res.status(201).json(document);
+     } catch (error) {
+       console.error("Document extraction failed:", error.message);
+ 
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 352c785..b5cca34 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -1,4 +1,4 @@
+-import { useRef, useState } from "react";
++import { useEffect, useRef, useState } from "react";
+ import { createQuickSummary } from "./quickSummary.js";
+ import "./App.css";
+ 
+@@ -15,13 +15,6 @@ function formatImportedAt(value) {
+   }).format(new Date(value));
+ }
+ 
+-function createDocumentId() {
+-  return (
+-    globalThis.crypto?.randomUUID?.() ??
+-    `${Date.now()}-${Math.random().toString(36).slice(2)}`
+-  );
+-}
+-
+ function OverviewSection({ title, items }) {
+   if (!items.length) return null;
+ 
+@@ -43,9 +36,55 @@ function App() {
+   const [activeDocumentId, setActiveDocumentId] = useState(null);
+   const [quickSummaries, setQuickSummaries] = useState({});
+   const [loading, setLoading] = useState(false);
++  const [savingHighlights, setSavingHighlights] = useState(false);
++  const [removingDocumentId, setRemovingDocumentId] = useState(null);
++  const [workspaceLoading, setWorkspaceLoading] = useState(true);
++  const [workspaceError, setWorkspaceError] = useState("");
+   const [error, setError] = useState("");
+   const fileInputRef = useRef(null);
+ 
++  useEffect(() => {
++    let isCurrent = true;
++
++    async function loadWorkspace() {
++      try {
++        const response = await fetch("/api/documents");
++        const result = await response.json().catch(() => []);
++
++        if (!response.ok) {
++          throw new Error(
++            result.error || "Could not open the saved document library.",
++          );
++        }
++
++        const savedDocuments = Array.isArray(result) ? result : [];
++        if (!isCurrent) return;
++
++        setDocuments(savedDocuments);
++        setActiveDocumentId(savedDocuments[0]?.id ?? null);
++        setQuickSummaries(
++          Object.fromEntries(
++            savedDocuments
++              .filter((document) => document.summary)
++              .map((document) => [document.id, document.summary]),
++          ),
++        );
++      } catch (loadError) {
++        if (!isCurrent) return;
++        setWorkspaceError(
++          loadError.message || "Could not open the saved document library.",
++        );
++      } finally {
++        if (isCurrent) setWorkspaceLoading(false);
++      }
++    }
++
++    loadWorkspace();
++    return () => {
++      isCurrent = false;
++    };
++  }, []);
++
+   const activeDocument = documents.find(
+     (document) => document.id === activeDocumentId,
+   );
+@@ -59,6 +98,11 @@ function App() {
+   async function handleExtract(event) {
+     event.preventDefault();
+ 
++    if (workspaceLoading || workspaceError) {
++      setError("The saved library must be available before adding documents.");
++      return;
++    }
++
+     if (!file) {
+       setError("Choose a PDF or TXT file to add it to your library.");
+       return;
+@@ -81,16 +125,11 @@ function App() {
+         throw new Error(result.error || "Could not read this file.");
+       }
+ 
+-      const importedDocument = {
+-        id: createDocumentId(),
+-        filename: result.filename,
+-        fileType: result.fileType,
+-        fileSize: file.size,
+-        characters: result.characters,
+-        importedAt: new Date().toISOString(),
+-        text: result.text,
+-        note: result.note,
+-      };
++      const importedDocument = result;
++
++      if (!importedDocument.id || typeof importedDocument.text !== "string") {
++        throw new Error("ClearDoc could not save the extracted document.");
++      }
+ 
+       setDocuments((currentDocuments) => [
+         importedDocument,
+@@ -109,27 +148,70 @@ function App() {
+     }
+   }
+ 
+-  function removeDocument(documentId) {
+-    setDocuments((currentDocuments) =>
+-      currentDocuments.filter((document) => document.id !== documentId),
+-    );
+-    setQuickSummaries((currentSummaries) => {
+-      const nextSummaries = { ...currentSummaries };
+-      delete nextSummaries[documentId];
+-      return nextSummaries;
+-    });
+-    setActiveDocumentId((currentId) =>
+-      currentId === documentId ? null : currentId,
+-    );
++  async function removeDocument(documentId) {
++    setRemovingDocumentId(documentId);
++    setError("");
++
++    try {
++      const response = await fetch(
++        `/api/documents/${encodeURIComponent(documentId)}`,
++        { method: "DELETE" },
++      );
++      const result = await response.json().catch(() => ({}));
++
++      if (!response.ok) {
++        throw new Error(result.error || "Could not remove this document.");
++      }
++
++      setDocuments((currentDocuments) =>
++        currentDocuments.filter((document) => document.id !== documentId),
++      );
++      setQuickSummaries((currentSummaries) => {
++        const nextSummaries = { ...currentSummaries };
++        delete nextSummaries[documentId];
++        return nextSummaries;
++      });
++      setActiveDocumentId((currentId) =>
++        currentId === documentId ? null : currentId,
++      );
++    } catch (removeError) {
++      setError(removeError.message || "Could not remove this document.");
++    } finally {
++      setRemovingDocumentId(null);
++    }
+   }
+ 
+-  function handleCreateQuickSummary() {
+-    if (!activeDocument) return;
++  async function handleCreateQuickSummary() {
++    if (!activeDocument || savingHighlights) return;
++
++    setSavingHighlights(true);
++    setError("");
++
++    try {
++      const summary = createQuickSummary(activeDocument.text);
++      const response = await fetch(
++        `/api/documents/${encodeURIComponent(activeDocument.id)}/summary`,
++        {
++          method: "PUT",
++          headers: { "Content-Type": "application/json" },
++          body: JSON.stringify({ summary }),
++        },
++      );
++      const result = await response.json().catch(() => ({}));
++
++      if (!response.ok) {
++        throw new Error(result.error || "Could not save the highlights.");
++      }
+ 
+-    setQuickSummaries((currentSummaries) => ({
+-      ...currentSummaries,
+-      [activeDocument.id]: createQuickSummary(activeDocument.text),
+-    }));
++      setQuickSummaries((currentSummaries) => ({
++        ...currentSummaries,
++        [activeDocument.id]: summary,
++      }));
++    } catch (summaryError) {
++      setError(summaryError.message || "Could not save the highlights.");
++    } finally {
++      setSavingHighlights(false);
++    }
+   }
+ 
+   return (
+@@ -191,7 +273,7 @@ function App() {
+                   id="document-upload"
+                   type="file"
+                   accept=".pdf,.txt,application/pdf,text/plain"
+-                  disabled={loading}
++                  disabled={loading || workspaceLoading || Boolean(workspaceError)}
+                   onChange={(event) => {
+                     setFile(event.target.files?.[0] || null);
+                     setError("");
+@@ -199,8 +281,16 @@ function App() {
+                 />
+               </label>
+ 
+-              <button className="primary-button" type="submit" disabled={!file || loading}>
+-                {loading ? (
++              <button
++                className="primary-button"
++                type="submit"
++                disabled={
++                  !file || loading || workspaceLoading || Boolean(workspaceError)
++                }
++              >
++                {workspaceLoading ? (
++                  "Opening saved library…"
++                ) : loading ? (
+                   <>
+                     <span className="spinner" aria-hidden="true" />
+                     Reading document…
+@@ -211,11 +301,17 @@ function App() {
+               </button>
+             </form>
+ 
++            {workspaceError && (
++              <p className="error-message" role="alert">
++                The saved library is unavailable. Start the ClearDoc backend,
++                then reload this page. {workspaceError}
++              </p>
++            )}
+             {error && <p className="error-message" role="alert">{error}</p>}
+ 
+             <p className="local-note">
+               <span aria-hidden="true">⌂</span>
+-              Your file is read by the ClearDoc backend on this device.
++              Documents and highlights are saved on this device.
+             </p>
+           </section>
+ 
+@@ -230,7 +326,16 @@ function App() {
+               </span>
+             </div>
+ 
+-            {documents.length === 0 ? (
++            {workspaceLoading ? (
++              <div className="library-empty">
++                <strong>Opening your saved library…</strong>
++              </div>
++            ) : workspaceError ? (
++              <div className="library-empty">
++                <strong>Saved library unavailable</strong>
++                <span>Reload after the backend is running.</span>
++              </div>
++            ) : documents.length === 0 ? (
+               <div className="library-empty">
+                 <span className="empty-file-icon" aria-hidden="true">
+                   <svg viewBox="0 0 32 32" fill="none">
+@@ -267,8 +372,9 @@ function App() {
+                       <button
+                         className="remove-button"
+                         type="button"
+-                        aria-label={`Remove ${document.filename} from this session`}
+-                        title="Remove from this session"
++                        aria-label={`Remove ${document.filename} from this device`}
++                        title="Remove saved document"
++                        disabled={removingDocumentId === document.id}
+                         onClick={() => removeDocument(document.id)}
+                       >
+                         ×
+@@ -303,11 +409,15 @@ function App() {
+                 <button
+                   className="summary-button"
+                   type="button"
+-                  disabled={!activeDocument.text.trim()}
++                  disabled={!activeDocument.text.trim() || savingHighlights}
+                   onClick={handleCreateQuickSummary}
+                 >
+                   <span aria-hidden="true">▤</span>
+-                  {activeQuickSummary ? "Refresh highlights" : "Create highlights"}
++                  {savingHighlights
++                    ? "Saving highlights…"
++                    : activeQuickSummary
++                      ? "Refresh highlights"
++                      : "Create highlights"}
+                 </button>
+                 <span>Processed on this device</span>
+               </div>
+@@ -383,8 +493,9 @@ function App() {
+       <footer className="app-footer">
+         <span>ClearDoc <span aria-hidden="true">·</span> Built for privacy</span>
+         <span>
+-          This library is kept in memory while this page is open. Documents,
+-          extracted text, and overviews are not saved between visits.
++          Document details, extracted text, and highlights are saved on this
++          device. The original PDF or TXT file is not retained. Removing a
++          document deletes its saved record.
+         </span>
+       </footer>
+     </main>
